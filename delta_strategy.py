@@ -58,7 +58,7 @@ def get_historical_data(exchange, symbol, timeframe='15m', limit=200):
 
 def get_straddle_graph(exchange, call_symbol, put_symbol, timeframe='15m', limit=200):
     """
-    Creates a straddle graph by combining the close prices of a call and put option.
+    Creates a straddle graph by combining the OHLC prices of a call and put option.
     """
     call_df = get_historical_data(exchange, call_symbol, timeframe, limit)
     put_df = get_historical_data(exchange, put_symbol, timeframe, limit)
@@ -66,11 +66,21 @@ def get_straddle_graph(exchange, call_symbol, put_symbol, timeframe='15m', limit
     if call_df is None or put_df is None:
         return None
 
-    straddle_df = pd.DataFrame(index=call_df.index)
-    straddle_df['close'] = call_df['close'] + put_df['close']
-    # pandas-ta requires high, low, close
-    straddle_df['high'] = straddle_df['close']
-    straddle_df['low'] = straddle_df['close']
+    # Use pd.merge to ensure timestamps are aligned correctly
+    combined_df = pd.merge(
+        call_df,
+        put_df,
+        left_index=True,
+        right_index=True,
+        how='inner',
+        suffixes=('_call', '_put')
+    )
+
+    # Create the straddle DataFrame
+    straddle_df = pd.DataFrame(index=combined_df.index)
+    straddle_df['close'] = combined_df['close_call'] + combined_df['close_put']
+    straddle_df['high'] = combined_df['high_call'] + combined_df['high_put']
+    straddle_df['low'] = combined_df['low_call'] + combined_df['low_put']
 
     return straddle_df
 
