@@ -26,14 +26,14 @@ def strike_job():
     print("Executing daily strike identification job...")
     exchange = get_exchange()
     exchange.set_sandbox_mode(True)
-    set_daily_atm_strike(exchange, 'BTC/USDT')
+    set_daily_atm_strike(exchange, 'BTC/USD')
 
 def trade_job():
     """Job for running the trading strategy."""
     print("Executing 15-minute trading job...")
     exchange = get_exchange()
     exchange.set_sandbox_mode(True)
-    run_scheduled_strategy(exchange, 'BTC/USDT')
+    run_scheduled_strategy(exchange, 'BTC/USD')
 
 def main():
     """
