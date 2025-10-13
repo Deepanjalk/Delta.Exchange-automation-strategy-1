@@ -62,7 +62,6 @@ def run_backtest():
 
     # --- Backtesting Loop ---
     balance = 1000  # Starting balance in USD
-    positions = {'call': None, 'put': None}
     trade_log = []
 
     def get_closest_strike(underlying_price, options):
@@ -114,6 +113,8 @@ def run_backtest():
     date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date))
 
     for current_date in date_range:
+        positions = {'call': None, 'put': None}
+        trade_count = 0
         current_date_str = current_date.strftime('%Y-%m-%d')
         print(f"\n--- Processing {current_date_str} ---")
 
@@ -163,34 +164,73 @@ def run_backtest():
         straddle_df['high'] = straddle_df['high_call'] + straddle_df['high_put']
         straddle_df['low'] = straddle_df['low_call'] + straddle_df['low_put']
 
-        straddle_df = get_supertrend(straddle_df, supertrend_length, supertrend_multiplier)
+        daily_straddle_data = pd.DataFrame()
 
         for index, row in straddle_df.iterrows():
-            supertrend_direction = row.get('supertrend_direction')
+            daily_straddle_data = daily_straddle_data.append(row)
+
+            if len(daily_straddle_data) < supertrend_length:
+                continue
+
+            # Calculate Supertrend on the incrementally collected data
+            supertrend_df = get_supertrend(daily_straddle_data.copy(), supertrend_length, supertrend_multiplier)
+            if supertrend_df is None or supertrend_df.empty:
+                continue
+
+            latest_signal = supertrend_df.iloc[-1]
+            supertrend_direction = latest_signal.get('supertrend_direction')
             action = determine_trade_action(supertrend_direction, positions)
 
-            if action == 'CREATE_STRADDLE':
+            if action == 'CREATE_STRADDLE' and trade_count < 3:
                 positions['call'] = {'entry_price': row['close_call'], 'type': 'sell'}
                 positions['put'] = {'entry_price': row['close_put'], 'type': 'sell'}
+                trade_count += 1
                 trade_log.append({
                     'timestamp': index,
                     'action': 'CREATE_STRADDLE',
                     'call_entry': row['close_call'],
-                    'put_entry': row['close_put']
+                    'put_entry': row['close_put'],
+                    'trade_of_day': trade_count
                 })
 
             elif action == 'CLOSE_LOSING_LEG':
                 if positions['call'] and positions['put']:
                     call_pnl = positions['call']['entry_price'] - row['close_call']
                     put_pnl = positions['put']['entry_price'] - row['close_put']
-                    pnl = call_pnl + put_pnl
-                    balance += pnl
+
+                    # The losing leg is the one with the lower PnL (higher loss or lower profit)
+                    if call_pnl < put_pnl:
+                        balance += call_pnl
+                        trade_log.append({
+                            'timestamp': index,
+                            'action': 'CLOSE_CALL_LEG',
+                            'pnl': call_pnl
+                        })
+                        positions['call'] = None  # Close only the call leg
+                    else:
+                        balance += put_pnl
+                        trade_log.append({
+                            'timestamp': index,
+                            'action': 'CLOSE_PUT_LEG',
+                            'pnl': put_pnl
+                        })
+                        positions['put'] = None  # Close only the put leg
+
+            elif action == 'RECONSTRUCT_STRADDLE':
+                if positions.get('call') is None:
+                    positions['call'] = {'entry_price': row['close_call'], 'type': 'sell'}
                     trade_log.append({
                         'timestamp': index,
-                        'action': 'CLOSE_STRADDLE',
-                        'pnl': pnl
+                        'action': 'RECONSTRUCT_SELL_CALL',
+                        'price': row['close_call']
                     })
-                    positions = {'call': None, 'put': None}
+                if positions.get('put') is None:
+                    positions['put'] = {'entry_price': row['close_put'], 'type': 'sell'}
+                    trade_log.append({
+                        'timestamp': index,
+                        'action': 'RECONSTRUCT_SELL_PUT',
+                        'price': row['close_put']
+                    })
 
     print("Backtest finished.")
 
