@@ -4,26 +4,24 @@ import os
 import pandas as pd
 from datetime import timedelta
 from dotenv import load_dotenv
-from delta_strategy import get_supertrend, determine_trade_action
+from delta_strategy import TradingStrategy
+import logging
+
+# --- Logger Setup ---
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
 
-def run_backtest():
+def run_backtest(start_date="2025-10-01", end_date="2025-10-07", timeframe='15m', supertrend_length=10, supertrend_multiplier=3):
     """
     Runs the backtesting simulation.
     """
-    print("Starting backtest...")
+    logger.info("Starting backtest...")
+    logger.info(f"Configuration: Start={start_date}, End={end_date}, Timeframe={timeframe}, Supertrend={supertrend_length},{supertrend_multiplier}")
 
-    # --- Parameters ---
-    # Note: Historical options data on Delta Exchange testnet can be sparse.
-    # Using a very recent date range is more likely to yield results.
-    start_date = "2024-05-01"
-    end_date = "2024-05-07"
-    timeframe = '15m'
-    supertrend_length = 10
-    supertrend_multiplier = 3
     symbol = 'BTC/USD'
+    strategy = TradingStrategy()
 
     # --- Exchange Setup ---
     exchange_id = 'delta'
@@ -39,7 +37,6 @@ def run_backtest():
         },
     })
 
-    # --- Historical Data Fetching ---
     def fetch_historical_data_for_backtest(symbol, date, timeframe):
         since = exchange.parse8601(date + 'T00:00:00Z')
         end = exchange.parse8601(date + 'T23:59:59Z')
@@ -52,7 +49,7 @@ def run_backtest():
                 all_ohlcv.extend(ohlcv)
                 since = ohlcv[-1][0] + exchange.parse_timeframe(timeframe) * 1000
             except Exception as e:
-                print(f"Error fetching historical data: {e}")
+                logger.error(f"Error fetching historical data: {e}")
                 break
         df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         if not df.empty:
@@ -60,97 +57,72 @@ def run_backtest():
             df.set_index('timestamp', inplace=True)
         return df
 
-    # --- Backtesting Loop ---
-    balance = 1000  # Starting balance in USD
+    balance = 1000
     trade_log = []
 
     def get_closest_strike(underlying_price, options):
-        if not options:
-            return None
-        closest_strike = None
-        min_diff = float('inf')
-        for s, m in options.items():
-            strike = m.get('strike')
-            if strike:
-                diff = abs(strike - underlying_price)
-                if diff < min_diff:
-                    min_diff = diff
-                    closest_strike = strike
-        return closest_strike
+        if not options: return None
+        return min(options, key=lambda s: abs(s['strike'] - underlying_price))['strike']
 
     def find_option_symbols_for_backtest(markets, underlying_symbol, strike_price, current_date):
         call_symbol, put_symbol = None, None
-
-        # Find the option with the closest expiry to the 24-hour cycle
-        min_expiry_diff = timedelta(days=100) # Initialize with a large diff
+        min_expiry_diff = timedelta(days=100)
 
         for symbol, market in markets.items():
             if market.get('strike') == strike_price and market.get('base') == underlying_symbol.split('/')[0]:
                 expiry = pd.to_datetime(market.get('expiry'), unit='ms')
-
-                # We're looking for daily expiries, so the difference should be small
                 if expiry > current_date:
                     diff = expiry - current_date
                     if diff < min_expiry_diff:
                         min_expiry_diff = diff
-                        # Reset symbols when a closer expiry is found
-                        call_symbol = None
-                        put_symbol = None
+                        call_symbol, put_symbol = (None, None)
 
-        # After finding the closest expiry, find the call and put for that expiry
         for symbol, market in markets.items():
-             if market.get('strike') == strike_price and market.get('base') == underlying_symbol.split('/')[0]:
+            if market.get('strike') == strike_price and market.get('base') == underlying_symbol.split('/')[0]:
                 expiry = pd.to_datetime(market.get('expiry'), unit='ms')
                 if expiry > current_date and (expiry - current_date) == min_expiry_diff:
-                    if market.get('optionType') == 'call':
-                        call_symbol = symbol
-                    elif market.get('optionType') == 'put':
-                        put_symbol = symbol
+                    if market.get('optionType') == 'call': call_symbol = symbol
+                    elif market.get('optionType') == 'put': put_symbol = symbol
 
         return call_symbol, put_symbol
-
 
     date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date))
 
     for current_date in date_range:
-        positions = {'call': None, 'put': None}
-        trade_count = 0
+        strategy.reset_daily_state()
         current_date_str = current_date.strftime('%Y-%m-%d')
-        print(f"\n--- Processing {current_date_str} ---")
+        logger.info(f"\n--- Processing {current_date_str} ---")
 
         exchange.load_markets(True)
         markets = exchange.markets
-        options = {
-            s: m for s, m in markets.items()
-            if m.get('option') and m.get('base') == symbol.split('/')[0]
-        }
+        options = [m for s, m in markets.items() if m.get('option') and m.get('base') == symbol.split('/')[0]]
 
         underlying_df_daily = fetch_historical_data_for_backtest(symbol, current_date_str, '1d')
         if underlying_df_daily.empty:
-            print(f"No underlying data for {current_date_str}, skipping.")
+            logger.warning(f"No underlying data for {current_date_str}, skipping.")
             continue
 
         underlying_price_eod = underlying_df_daily.iloc[0]['close']
         atm_strike_price = get_closest_strike(underlying_price_eod, options)
 
         if atm_strike_price is None:
-            print(f"Could not find ATM strike for underlying price {underlying_price_eod}")
+            logger.warning(f"Could not find ATM strike for underlying price {underlying_price_eod}")
             continue
 
-        print(f"Underlying Price: {underlying_price_eod}, ATM Strike Price: {atm_strike_price}")
+        logger.info(f"Underlying Price: {underlying_price_eod}, ATM Strike Price: {atm_strike_price}")
 
         call_symbol, put_symbol = find_option_symbols_for_backtest(markets, symbol, atm_strike_price, current_date)
         if not all([call_symbol, put_symbol]):
-            print(f"Could not find option symbols for strike {atm_strike_price}.")
+            logger.warning(f"Could not find option symbols for strike {atm_strike_price}.")
             continue
 
-        print(f"Using Call: {call_symbol}, Put: {put_symbol}")
+        logger.info(f"Using Call: {call_symbol}, Put: {put_symbol}")
 
         call_df = fetch_historical_data_for_backtest(call_symbol, current_date_str, timeframe)
         put_df = fetch_historical_data_for_backtest(put_symbol, current_date_str, timeframe)
 
         if call_df.empty or put_df.empty:
-            print(f"No historical options data for {current_date_str}.")
+            logger.warning(f"No historical options data for {current_date_str}.")
             continue
 
         straddle_df = pd.merge(
@@ -164,89 +136,67 @@ def run_backtest():
         straddle_df['high'] = straddle_df['high_call'] + straddle_df['high_put']
         straddle_df['low'] = straddle_df['low_call'] + straddle_df['low_put']
 
-        daily_straddle_data = pd.DataFrame()
-
         for index, row in straddle_df.iterrows():
-            daily_straddle_data = daily_straddle_data.append(row)
+            strategy.straddle_data_df = pd.concat([strategy.straddle_data_df, row.to_frame().T])
 
-            if len(daily_straddle_data) < supertrend_length:
+            if len(strategy.straddle_data_df) < supertrend_length:
                 continue
 
-            # Calculate Supertrend on the incrementally collected data
-            supertrend_df = get_supertrend(daily_straddle_data.copy(), supertrend_length, supertrend_multiplier)
+            supertrend_df = strategy._get_supertrend(strategy.straddle_data_df.copy(), supertrend_length, supertrend_multiplier)
             if supertrend_df is None or supertrend_df.empty:
                 continue
 
             latest_signal = supertrend_df.iloc[-1]
             supertrend_direction = latest_signal.get('supertrend_direction')
-            action = determine_trade_action(supertrend_direction, positions)
+            action = strategy._determine_trade_action(supertrend_direction)
 
-            if action == 'CREATE_STRADDLE' and trade_count < 3:
-                positions['call'] = {'entry_price': row['close_call'], 'type': 'sell'}
-                positions['put'] = {'entry_price': row['close_put'], 'type': 'sell'}
-                trade_count += 1
+            if action == 'CREATE_STRADDLE' and strategy.trade_count < 3:
+                strategy.straddle_positions['call'] = {'entry_price': row['close_call'], 'type': 'sell'}
+                strategy.straddle_positions['put'] = {'entry_price': row['close_put'], 'type': 'sell'}
+                strategy.trade_count += 1
                 trade_log.append({
-                    'timestamp': index,
-                    'action': 'CREATE_STRADDLE',
-                    'call_entry': row['close_call'],
-                    'put_entry': row['close_put'],
-                    'trade_of_day': trade_count
+                    'timestamp': index, 'action': 'CREATE_STRADDLE',
+                    'call_entry': row['close_call'], 'put_entry': row['close_put'],
+                    'trade_of_day': strategy.trade_count
                 })
 
             elif action == 'CLOSE_LOSING_LEG':
-                if positions['call'] and positions['put']:
-                    call_pnl = positions['call']['entry_price'] - row['close_call']
-                    put_pnl = positions['put']['entry_price'] - row['close_put']
+                if strategy.straddle_positions['call'] and strategy.straddle_positions['put']:
+                    call_pnl = strategy.straddle_positions['call']['entry_price'] - row['close_call']
+                    put_pnl = strategy.straddle_positions['put']['entry_price'] - row['close_put']
 
-                    # The losing leg is the one with the lower PnL (higher loss or lower profit)
                     if call_pnl < put_pnl:
                         balance += call_pnl
-                        trade_log.append({
-                            'timestamp': index,
-                            'action': 'CLOSE_CALL_LEG',
-                            'pnl': call_pnl
-                        })
-                        positions['call'] = None  # Close only the call leg
+                        trade_log.append({'timestamp': index, 'action': 'CLOSE_CALL_LEG', 'pnl': call_pnl})
+                        strategy.straddle_positions['call'] = None
                     else:
                         balance += put_pnl
-                        trade_log.append({
-                            'timestamp': index,
-                            'action': 'CLOSE_PUT_LEG',
-                            'pnl': put_pnl
-                        })
-                        positions['put'] = None  # Close only the put leg
+                        trade_log.append({'timestamp': index, 'action': 'CLOSE_PUT_LEG', 'pnl': put_pnl})
+                        strategy.straddle_positions['put'] = None
 
             elif action == 'RECONSTRUCT_STRADDLE':
-                if positions.get('call') is None:
-                    positions['call'] = {'entry_price': row['close_call'], 'type': 'sell'}
-                    trade_log.append({
-                        'timestamp': index,
-                        'action': 'RECONSTRUCT_SELL_CALL',
-                        'price': row['close_call']
-                    })
-                if positions.get('put') is None:
-                    positions['put'] = {'entry_price': row['close_put'], 'type': 'sell'}
-                    trade_log.append({
-                        'timestamp': index,
-                        'action': 'RECONSTRUCT_SELL_PUT',
-                        'price': row['close_put']
-                    })
+                if strategy.straddle_positions.get('call') is None:
+                    strategy.straddle_positions['call'] = {'entry_price': row['close_call'], 'type': 'sell'}
+                    trade_log.append({'timestamp': index, 'action': 'RECONSTRUCT_SELL_CALL', 'price': row['close_call']})
+                if strategy.straddle_positions.get('put') is None:
+                    strategy.straddle_positions['put'] = {'entry_price': row['close_put'], 'type': 'sell'}
+                    trade_log.append({'timestamp': index, 'action': 'RECONSTRUCT_SELL_PUT', 'price': row['close_put']})
 
-    print("Backtest finished.")
-
+    logger.info("Backtest finished.")
     total_trades = len([t for t in trade_log if t['action'] == 'CREATE_STRADDLE'])
     winning_trades = len([t for t in trade_log if t.get('pnl', 0) > 0])
     win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
 
-    print("\n--- Backtesting Results ---")
-    print(f"Starting Balance: 1000 USD")
-    print(f"Final Balance: {balance:.2f} USD")
-    print(f"Total Trades: {total_trades}")
-    print(f"Winning Trades: {winning_trades}")
-    print(f"Win Rate: {win_rate:.2f}%")
-    print("\nTrade Log:")
+    logger.info("\n--- Backtesting Results ---")
+    logger.info(f"Starting Balance: 1000 USD")
+    logger.info(f"Final Balance: {balance:.2f} USD")
+    logger.info(f"Total Trades: {total_trades}")
+    logger.info(f"Winning Trades: {winning_trades}")
+    logger.info(f"Win Rate: {win_rate:.2f}%")
+    logger.info("\nTrade Log:")
     for trade in trade_log:
-        print(trade)
+        logger.info(trade)
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
     run_backtest()
