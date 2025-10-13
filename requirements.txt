@@ -2,3 +2,4 @@ ccxt
 pandas
 pandas-ta
 schedule
+python-dotenv

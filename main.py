@@ -3,8 +3,12 @@ import ccxt
 import os
 import time
 import schedule
+from dotenv import load_dotenv
 from delta_strategy import set_daily_atm_strike, run_scheduled_strategy, reset_daily_state
 from backtest import run_backtest
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- Exchange Setup ---
 def get_exchange():
