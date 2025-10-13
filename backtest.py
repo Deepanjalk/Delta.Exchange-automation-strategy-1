@@ -3,7 +3,11 @@ import ccxt
 import os
 import pandas as pd
 from datetime import timedelta
+from dotenv import load_dotenv
 from delta_strategy import get_supertrend, determine_trade_action
+
+# Load environment variables from .env file
+load_dotenv()
 
 def run_backtest():
     """
