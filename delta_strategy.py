@@ -112,25 +112,32 @@ def find_option_symbols(exchange, underlying_symbol, strike_price):
     return call_symbol, put_symbol
 
 
-def run_strategy(exchange, symbol):
+def set_daily_atm_strike(exchange, symbol):
     """
-    Runs the main trading strategy.
+    Identifies and sets the ATM strike price for the day.
+    """
+    global atm_strike_price
+    print("Identifying ATM strike price for the day...")
+    atm_strike_price = get_atm_strike_price(exchange, symbol)
+    if atm_strike_price is None:
+        print("Could not determine ATM strike price. Trading will be paused.")
+
+def run_scheduled_strategy(exchange, symbol):
+    """
+    Runs the main trading strategy logic at scheduled intervals.
     """
     global trade_count, atm_strike_price, straddle_positions
+
+    if atm_strike_price is None:
+        print("ATM strike price not set for the day. Cannot run strategy.")
+        return
+
     print("\n" + "="*50)
     print(f"Executing strategy run. Trade count: {trade_count}")
 
     if trade_count >= 3:
         print("Maximum trade count reached for the day. Stopping.")
         return
-
-    # 1. Daily Setup: Identify ATM strike if not already set
-    if atm_strike_price is None:
-        print("Identifying ATM strike price for the day...")
-        atm_strike_price = get_atm_strike_price(exchange, symbol)
-        if atm_strike_price is None:
-            print("Could not determine ATM strike price. Exiting.")
-            return
 
     # Find the symbols for the ATM call and put options
     call_symbol, put_symbol = find_option_symbols(exchange, symbol, atm_strike_price)
@@ -140,7 +147,7 @@ def run_strategy(exchange, symbol):
 
     print(f"Using ATM Call: {call_symbol}, ATM Put: {put_symbol}")
 
-    # 2. Create Straddle Graph and get Supertrend
+    # Create Straddle Graph and get Supertrend
     straddle_df = get_straddle_graph(exchange, call_symbol, put_symbol)
     if straddle_df is None:
         print("Could not create straddle graph. Exiting.")
@@ -154,55 +161,50 @@ def run_strategy(exchange, symbol):
     latest_signal = straddle_df.iloc[-1]
     supertrend_direction = latest_signal.get('SUPERTd_10_3')
 
-    # 3. Trade Rules
-    if supertrend_direction == -1: # SELL Signal
-        print("Supertrend is in SELL mode.")
-        if straddle_positions['call'] is None and straddle_positions['put'] is None:
-            print("Case A: No open positions. Creating straddle.")
-            # Sell ATM Call + ATM Put
+    # Determine and execute trade action
+    action = determine_trade_action(supertrend_direction, straddle_positions)
+    print(f"Supertrend Signal: {'BUY' if supertrend_direction == 1 else 'SELL' if supertrend_direction == -1 else 'NONE'}")
+    print(f"Determined Action: {action}")
+
+    if action == 'CREATE_STRADDLE':
+        print("Case A: No open positions. Creating straddle.")
+        call_order = place_order(exchange, call_symbol, 'market', 'sell', 1)
+        put_order = place_order(exchange, put_symbol, 'market', 'sell', 1)
+        if call_order and put_order:
+            straddle_positions['call'] = call_order
+            straddle_positions['put'] = put_order
+            trade_count += 1
+            print("Straddle created successfully.")
+
+    elif action == 'RECONSTRUCT_STRADDLE':
+        print("Case C: One leg open. Reconstructing straddle.")
+        if straddle_positions['call'] is None:
             call_order = place_order(exchange, call_symbol, 'market', 'sell', 1)
-            put_order = place_order(exchange, put_symbol, 'market', 'sell', 1)
-            if call_order and put_order:
+            if call_order:
                 straddle_positions['call'] = call_order
+                print("Reconstructed straddle by selling call.")
+        if straddle_positions['put'] is None:
+            put_order = place_order(exchange, put_symbol, 'market', 'sell', 1)
+            if put_order:
                 straddle_positions['put'] = put_order
-                trade_count += 1
-                print("Straddle created successfully.")
-        elif straddle_positions['call'] is None or straddle_positions['put'] is None:
-             print("Case C: One leg open. Reconstructing straddle.")
-             if straddle_positions['call'] is None:
-                call_order = place_order(exchange, call_symbol, 'market', 'sell', 1)
-                if call_order:
-                    straddle_positions['call'] = call_order
-                    print("Reconstructed straddle by selling call.")
-             if straddle_positions['put'] is None:
-                put_order = place_order(exchange, put_symbol, 'market', 'sell', 1)
-                if put_order:
-                    straddle_positions['put'] = put_order
-                    print("Reconstructed straddle by selling put.")
+                print("Reconstructed straddle by selling put.")
 
-
-    elif supertrend_direction == 1: # BUY Signal
-        print("Supertrend is in BUY mode.")
-        if straddle_positions['call'] and straddle_positions['put']:
-            print("Case B: Straddle open. Closing the gaining leg.")
-            # Determine which leg to close
-            call_ticker = exchange.fetch_ticker(call_symbol)
-            put_ticker = exchange.fetch_ticker(put_symbol)
-
-            # Simplified logic: assume underlying move determines gainer
-            underlying_ticker = exchange.fetch_ticker(symbol)
-            if underlying_ticker['last'] > atm_strike_price: # Underlying went up
-                print("Underlying is up. Closing call position.")
-                close_order = place_order(exchange, call_symbol, 'market', 'buy', 1)
-                if close_order:
-                    straddle_positions['call'] = None
-            else: # Underlying went down
-                print("Underlying is down. Closing put position.")
-                close_order = place_order(exchange, put_symbol, 'market', 'buy', 1)
-                if close_order:
-                    straddle_positions['put'] = None
+    elif action == 'CLOSE_GAINING_LEG':
+        print("Case B: Straddle open. Closing the gaining leg.")
+        # Simplified logic for now
+        underlying_ticker = exchange.fetch_ticker(symbol)
+        if underlying_ticker['last'] > atm_strike_price:
+            print("Underlying is up. Closing call position.")
+            close_order = place_order(exchange, call_symbol, 'market', 'buy', 1)
+            if close_order:
+                straddle_positions['call'] = None
+        else:
+            print("Underlying is down. Closing put position.")
+            close_order = place_order(exchange, put_symbol, 'market', 'buy', 1)
+            if close_order:
+                straddle_positions['put'] = None
     else:
-        print("No valid Supertrend signal found.")
+        print("No trade action taken.")
 
     print(f"Current positions: {straddle_positions}")
     print("="*50 + "\n")
