@@ -4,6 +4,7 @@ import pandas as pd
 import pandas_ta as ta
 import time
 import logging
+from config import TIMEFRAME, SUPERTREND_LENGTH, SUPERTREND_MULTIPLIER
 
 # --- Logger Setup ---
 logger = logging.getLogger(__name__)
@@ -12,6 +13,8 @@ class TradingStrategy:
     def __init__(self):
         self.trade_count = 0
         self.atm_strike_price = None
+        self.call_symbol = None
+        self.put_symbol = None
         self.straddle_positions = {'call': None, 'put': None}
         self.straddle_data_df = pd.DataFrame()
 
@@ -32,6 +35,9 @@ class TradingStrategy:
             if not options:
                 logger.warning(f"No options found for {symbol.split('/')[0]}")
                 return None
+
+            logger.info(f"Found {len(options)} options for {symbol.split('/')[0]}")
+
             closest_strike = None
             min_diff = float('inf')
             for s, m in options.items():
@@ -47,12 +53,12 @@ class TradingStrategy:
             logger.error(f"An error occurred: {e}")
             return None
 
-    def _get_historical_data(self, exchange, symbol, timeframe='15m', limit=200):
+    def _get_historical_data(self, exchange, symbol, limit=200):
         """
         Fetches historical OHLCV data.
         """
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
@@ -61,12 +67,12 @@ class TradingStrategy:
             logger.error(f"An error occurred while fetching historical data for {symbol}: {e}")
             return None
 
-    def _get_straddle_graph(self, exchange, call_symbol, put_symbol, timeframe='15m', limit=200):
+    def _get_straddle_graph(self, exchange, call_symbol, put_symbol, limit=200):
         """
         Creates a straddle graph by combining the OHLC prices of a call and put option.
         """
-        call_df = self._get_historical_data(exchange, call_symbol, timeframe, limit)
-        put_df = self._get_historical_data(exchange, put_symbol, timeframe, limit)
+        call_df = self._get_historical_data(exchange, call_symbol, limit)
+        put_df = self._get_historical_data(exchange, put_symbol, limit)
 
         if call_df is None or put_df is None:
             return None
@@ -87,29 +93,45 @@ class TradingStrategy:
 
         return straddle_df
 
-    def _get_supertrend(self, df, length=10, multiplier=3):
+    def _get_supertrend(self, df):
         """
-        Calculates the Supertrend indicator.
+        Calculates the Supertrend indicator using settings from the config file.
         """
         if df is None or df.empty:
             return None
-        df.ta.supertrend(length=length, multiplier=multiplier, append=True)
-        df.rename(columns={f'SUPERTd_{length}_{multiplier}': 'supertrend_direction'}, inplace=True)
+        df.ta.supertrend(length=SUPERTREND_LENGTH, multiplier=SUPERTREND_MULTIPLIER, append=True)
+        df.rename(columns={f'SUPERTd_{SUPERTREND_LENGTH}_{SUPERTREND_MULTIPLIER}': 'supertrend_direction'}, inplace=True)
+        logger.info(f"Calculated Supertrend. Latest direction: {df.iloc[-1]['supertrend_direction']}")
         return df
 
     def _place_order(self, exchange, symbol, order_type, side, amount, price=None):
         """
-        Places an order.
+        Places an order and verifies its status.
+        Returns the order object and a boolean indicating if it was filled.
         """
         try:
             logger.info(f"Placing {side} {order_type} order for {amount} contracts of {symbol}...")
+
             if order_type == 'limit':
-                return exchange.create_order(symbol, order_type, side, amount, price)
+                order = exchange.create_order(symbol, order_type, side, amount, price)
             else:
-                return exchange.create_order(symbol, order_type, side, amount)
+                order = exchange.create_order(symbol, order_type, side, amount)
+
+            # Verify order status
+            time.sleep(2) # Allow time for the order to be processed
+            fetched_order = exchange.fetch_order(order['id'], symbol)
+
+            is_filled = fetched_order['status'] == 'closed'
+            if is_filled:
+                logger.info(f"Order {order['id']} successfully filled.")
+            else:
+                logger.warning(f"Order {order['id']} status is {fetched_order['status']}.")
+
+            return fetched_order, is_filled
+
         except ccxt.errors.ExchangeError as e:
             logger.error(f"An error occurred while placing an order: {e}")
-            return None
+            return None, False
 
     def _determine_trade_action(self, supertrend_direction):
         """
@@ -171,10 +193,10 @@ class TradingStrategy:
             logger.error(f"Could not find option symbols for strike {self.atm_strike_price}. Exiting.")
             return
 
-        logger.info(f"Using ATM Call: {call_symbol}, ATM Put: {put_symbol}")
+        logger.info(f"Using ATM Call: {self.call_symbol}, ATM Put: {self.put_symbol}")
 
-        call_df = self._get_historical_data(exchange, call_symbol, timeframe='15m', limit=2)
-        put_df = self._get_historical_data(exchange, put_symbol, timeframe='15m', limit=2)
+        call_df = self._get_historical_data(exchange, self.call_symbol, limit=2)
+        put_df = self._get_historical_data(exchange, self.put_symbol, limit=2)
 
         if call_df is None or put_df is None or call_df.empty or put_df.empty:
             logger.warning("Could not fetch latest candle data. Exiting.")
@@ -203,7 +225,7 @@ class TradingStrategy:
 
         logger.info(f"Collected {len(self.straddle_data_df)} candles for the day.")
 
-        if len(self.straddle_data_df) < 10:
+        if len(self.straddle_data_df) < SUPERTREND_LENGTH:
             logger.info("Not enough data to calculate Supertrend yet. Waiting for more candles.")
             return
 
@@ -217,46 +239,46 @@ class TradingStrategy:
         supertrend_direction = latest_signal.get('supertrend_direction')
 
         action = self._determine_trade_action(supertrend_direction)
+
         logger.info(f"Supertrend Signal: {'BUY' if supertrend_direction == 1 else 'SELL' if supertrend_direction == -1 else 'NONE'}")
+        logger.info(f"Current Positions: Call: {'Open' if self.straddle_positions['call'] else 'Closed'}, Put: {'Open' if self.straddle_positions['put'] else 'Closed'}")
         logger.info(f"Determined Action: {action}")
 
         if action == 'CREATE_STRADDLE':
             logger.info("Case A: Creating straddle.")
-            call_order = self._place_order(exchange, call_symbol, 'market', 'sell', 1)
-            put_order = self._place_order(exchange, put_symbol, 'market', 'sell', 1)
-            if call_order and put_order:
+            call_order, call_filled = self._place_order(exchange, self.call_symbol, 'market', 'sell', 1)
+            put_order, put_filled = self._place_order(exchange, self.put_symbol, 'market', 'sell', 1)
+
+            if call_filled and put_filled:
                 call_entry_price = call_order.get('average') or call_order.get('price')
                 put_entry_price = put_order.get('average') or put_order.get('price')
 
-                if call_entry_price and put_entry_price:
-                    self.straddle_positions['call'] = {'order_id': call_order['id'], 'entry_price': call_entry_price}
-                    self.straddle_positions['put'] = {'order_id': put_order['id'], 'entry_price': put_entry_price}
-                    self.trade_count += 1
-                    logger.info(f"Straddle created. Call entry: {call_entry_price}, Put entry: {put_entry_price}")
-                else:
-                    logger.error("Could not determine entry prices for straddle. Orders might not have filled.")
+                self.straddle_positions['call'] = {'order_id': call_order['id'], 'entry_price': call_entry_price}
+                self.straddle_positions['put'] = {'order_id': put_order['id'], 'entry_price': put_entry_price}
+                self.trade_count += 1
+                logger.info(f"Straddle created. Call entry: {call_entry_price}, Put entry: {put_entry_price}")
+            else:
+                logger.error("Failed to create complete straddle. One or both orders did not fill.")
 
         elif action == 'RECONSTRUCT_STRADDLE':
             logger.info("Case C: Reconstructing straddle.")
             if self.straddle_positions.get('call') is None:
-                call_order = self._place_order(exchange, call_symbol, 'market', 'sell', 1)
-                if call_order:
+                call_order, call_filled = self._place_order(exchange, self.call_symbol, 'market', 'sell', 1)
+                if call_filled:
                     call_entry_price = call_order.get('average') or call_order.get('price')
-                    if call_entry_price:
-                        self.straddle_positions['call'] = {'order_id': call_order['id'], 'entry_price': call_entry_price}
-                        logger.info(f"Reconstructed straddle by selling call at {call_entry_price}.")
-                    else:
-                        logger.error("Could not determine entry price for call. Order might not have filled.")
+                    self.straddle_positions['call'] = {'order_id': call_order['id'], 'entry_price': call_entry_price}
+                    logger.info(f"Reconstructed straddle by selling call at {call_entry_price}.")
+                else:
+                    logger.error("Failed to reconstruct straddle. Call order did not fill.")
 
             if self.straddle_positions.get('put') is None:
-                put_order = self._place_order(exchange, put_symbol, 'market', 'sell', 1)
-                if put_order:
+                put_order, put_filled = self._place_order(exchange, self.put_symbol, 'market', 'sell', 1)
+                if put_filled:
                     put_entry_price = put_order.get('average') or put_order.get('price')
-                    if put_entry_price:
-                        self.straddle_positions['put'] = {'order_id': put_order['id'], 'entry_price': put_entry_price}
-                        logger.info(f"Reconstructed straddle by selling put at {put_entry_price}.")
-                    else:
-                        logger.error("Could not determine entry price for put. Order might not have filled.")
+                    self.straddle_positions['put'] = {'order_id': put_order['id'], 'entry_price': put_entry_price}
+                    logger.info(f"Reconstructed straddle by selling put at {put_entry_price}.")
+                else:
+                    logger.error("Failed to reconstruct straddle. Put order did not fill.")
 
         elif action == 'CLOSE_LOSING_LEG':
             logger.info("Case B: Closing the losing leg.")
@@ -277,13 +299,13 @@ class TradingStrategy:
 
                 if call_pnl < put_pnl:
                     logger.info("Call is the losing leg. Closing call position.")
-                    close_order = self._place_order(exchange, call_symbol, 'market', 'buy', 1)
-                    if close_order:
+                    close_order, order_filled = self._place_order(exchange, self.call_symbol, 'market', 'buy', 1)
+                    if order_filled:
                         self.straddle_positions['call'] = None
                 else:
                     logger.info("Put is the losing leg. Closing put position.")
-                    close_order = self._place_order(exchange, put_symbol, 'market', 'buy', 1)
-                    if close_order:
+                    close_order, order_filled = self._place_order(exchange, self.put_symbol, 'market', 'buy', 1)
+                    if order_filled:
                         self.straddle_positions['put'] = None
             except (ccxt.errors.ExchangeError, KeyError) as e:
                 logger.error(f"An error occurred while closing losing leg: {e}")
