@@ -8,6 +8,7 @@ import time
 trade_count = 0
 atm_strike_price = None
 straddle_positions = {'call': None, 'put': None}
+straddle_data_df = pd.DataFrame() # For collecting daily straddle data
 
 def get_atm_strike_price(exchange, symbol):
     """
@@ -107,9 +108,9 @@ def determine_trade_action(supertrend_direction, straddle_positions):
     if supertrend_direction == -1 and not is_call_open and not is_put_open:
         return 'CREATE_STRADDLE'
 
-    # Case B: Supertrend is BUY and both legs of the straddle are open -> Close the gaining leg
+    # Case B: Supertrend is BUY and both legs of the straddle are open -> Close the losing leg
     elif supertrend_direction == 1 and is_call_open and is_put_open:
-        return 'CLOSE_GAINING_LEG'
+        return 'CLOSE_LOSING_LEG'
 
     # Case C: Supertrend flips back to SELL and one leg is open -> Reconstruct the straddle
     elif supertrend_direction == -1 and (is_call_open ^ is_put_open):
@@ -170,18 +171,55 @@ def run_scheduled_strategy(exchange, symbol):
 
     print(f"Using ATM Call: {call_symbol}, ATM Put: {put_symbol}")
 
-    # Create Straddle Graph and get Supertrend
-    straddle_df = get_straddle_graph(exchange, call_symbol, put_symbol)
-    if straddle_df is None:
-        print("Could not create straddle graph. Exiting.")
-        return
-    straddle_df = get_supertrend(straddle_df)
+    # --- Incremental Data Collection for Supertrend ---
+    global straddle_data_df
 
-    if straddle_df is None:
+    # Fetch the latest 2 candles to ensure we get a closed candle
+    call_df = get_historical_data(exchange, call_symbol, timeframe='15m', limit=2)
+    put_df = get_historical_data(exchange, put_symbol, timeframe='15m', limit=2)
+
+    if call_df is None or put_df is None or call_df.empty or put_df.empty:
+        print("Could not fetch latest candle data. Exiting.")
+        return
+
+    latest_call_candle = call_df.iloc[-1]
+    latest_put_candle = put_df.iloc[-1]
+
+    # Ensure timestamps match
+    if latest_call_candle.name != latest_put_candle.name:
+        print("Candle timestamps do not match. Exiting.")
+        return
+
+    # Construct the straddle candle
+    straddle_candle = {
+        'timestamp': latest_call_candle.name,
+        'open': latest_call_candle['open'] + latest_put_candle['open'],
+        'high': latest_call_candle['high'] + latest_put_candle['high'],
+        'low': latest_call_candle['low'] + latest_put_candle['low'],
+        'close': latest_call_candle['close'] + latest_put_candle['close'],
+        'volume': latest_call_candle['volume'] + latest_put_candle['volume']
+    }
+
+    # Append to the daily DataFrame, avoiding duplicates
+    if straddle_candle['timestamp'] not in straddle_data_df.index:
+        straddle_data_df = straddle_data_df.append(pd.Series(straddle_candle, name=straddle_candle['timestamp']))
+        straddle_data_df.index.name = 'timestamp'
+
+    print(f"Collected {len(straddle_data_df)} candles for the day.")
+
+    # We need at least 'length' candles to calculate Supertrend
+    if len(straddle_data_df) < 10:
+        print("Not enough data to calculate Supertrend yet. Waiting for more candles.")
+        return
+
+    # Calculate Supertrend on the collected data
+    supertrend_df = get_supertrend(straddle_data_df.copy()) # Use a copy to avoid modifying the original df
+
+    if supertrend_df is None or supertrend_df.empty:
         print("Could not calculate Supertrend. Exiting.")
         return
 
-    latest_signal = straddle_df.iloc[-1]
+    latest_signal = supertrend_df.iloc[-1]
     supertrend_direction = latest_signal.get('SUPERTd_10_3')
 
     # Determine and execute trade action
@@ -227,8 +265,8 @@ def run_scheduled_strategy(exchange, symbol):
                 else:
                     print("Could not determine entry price for put. Order might not have filled.")
 
-    elif action == 'CLOSE_GAINING_LEG':
-        print("Case B: Closing the gaining leg.")
+    elif action == 'CLOSE_LOSING_LEG':
+        print("Case B: Closing the losing leg.")
         try:
             call_ticker = exchange.fetch_ticker(call_symbol)
             put_ticker = exchange.fetch_ticker(put_symbol)
@@ -258,7 +296,7 @@ def run_scheduled_strategy(exchange, symbol):
                 if close_order:
                     straddle_positions['put'] = None
         except (ccxt.errors.ExchangeError, KeyError) as e:
-            print(f"An error occurred while closing gaining leg: {e}")
+            print(f"An error occurred while closing losing leg: {e}")
 
     elif action == 'HOLD':
         print("Holding positions.")
@@ -271,8 +309,9 @@ def run_scheduled_strategy(exchange, symbol):
 
 # Reset state for the next day (to be called by the scheduler)
 def reset_daily_state():
-    global trade_count, atm_strike_price, straddle_positions
+    global trade_count, atm_strike_price, straddle_positions, straddle_data_df
     print("Resetting daily state for new trading session.")
     trade_count = 0
     atm_strike_price = None
     straddle_positions = {'call': None, 'put': None}
+    straddle_data_df = pd.DataFrame() # Clear the daily data
