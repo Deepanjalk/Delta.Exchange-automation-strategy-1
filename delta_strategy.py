@@ -91,6 +91,8 @@ def get_supertrend(df, length=10, multiplier=3):
     if df is None or df.empty:
         return None
     df.ta.supertrend(length=length, multiplier=multiplier, append=True)
+    # Rename the column for consistency
+    df.rename(columns={f'SUPERTd_{length}_{multiplier}': 'supertrend_direction'}, inplace=True)
     return df
 
 def place_order(exchange, symbol, order_type, side, amount, price=None):
@@ -230,7 +232,7 @@ def run_scheduled_strategy(exchange, symbol):
         return
 
     latest_signal = supertrend_df.iloc[-1]
-    supertrend_direction = latest_signal.get('SUPERTd_10_3')
+    supertrend_direction = latest_signal.get('supertrend_direction')
 
     # Determine and execute trade action
     action = determine_trade_action(supertrend_direction, straddle_positions)
