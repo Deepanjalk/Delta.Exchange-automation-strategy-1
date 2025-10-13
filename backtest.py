@@ -10,6 +10,13 @@ def run_backtest():
     """
     print("Starting backtest...")
 
+    print("\n*** DISCLAIMER: BACKTESTING LIMITATIONS ***")
+    print("This backtester simulates the strategy using the underlying asset's historical data.")
+    print("It does NOT use historical options data, which is often unavailable.")
+    print("Option prices are ESTIMATED, and therefore the results are a rough approximation.")
+    print("Do not consider these results a reliable indicator of the strategy's future performance.")
+    print("*******************************************\n")
+
     # --- User Input ---
     start_date = input("Enter start date (YYYY-MM-DD): ")
     end_date = input("Enter end date (YYYY-MM-DD): ")
@@ -25,7 +32,7 @@ def run_backtest():
         'apiKey': os.environ.get('DELTA_API_KEY'),
         'secret': os.environ.get('DELTA_API_SECRET'),
         'urls': {
-            'api': 'https://testnet-api.delta.exchange',
+            'api': 'https://api.india.delta.exchange',
         },
     })
     exchange.set_sandbox_mode(True)

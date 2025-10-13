@@ -13,7 +13,7 @@ def get_exchange():
     return exchange_class({
         'apiKey': os.environ.get('DELTA_API_KEY'),
         'secret': os.environ.get('DELTA_API_SECRET'),
-        'urls': { 'api': 'https://testnet-api.delta.exchange' },
+        'urls': { 'api': 'https://api.india.delta.exchange' },
         'options': { 'recvWindow': 10000 },
     })
 
