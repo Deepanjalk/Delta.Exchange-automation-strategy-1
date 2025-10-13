@@ -96,6 +96,29 @@ def place_order(exchange, symbol, order_type, side, amount, price=None):
         print(f"An error occurred while placing an order: {e}")
         return None
 
+def determine_trade_action(supertrend_direction, straddle_positions):
+    """
+    Determines the trade action based on the Supertrend signal and current positions.
+    """
+    is_call_open = straddle_positions.get('call') is not None
+    is_put_open = straddle_positions.get('put') is not None
+
+    # Case A: Supertrend is SELL and no positions are open -> Create a straddle
+    if supertrend_direction == -1 and not is_call_open and not is_put_open:
+        return 'CREATE_STRADDLE'
+
+    # Case B: Supertrend is BUY and both legs of the straddle are open -> Close the gaining leg
+    elif supertrend_direction == 1 and is_call_open and is_put_open:
+        return 'CLOSE_GAINING_LEG'
+
+    # Case C: Supertrend flips back to SELL and one leg is open -> Reconstruct the straddle
+    elif supertrend_direction == -1 and (is_call_open ^ is_put_open):
+        return 'RECONSTRUCT_STRADDLE'
+
+    # Hold positions if the signal is unchanged or doesn't warrant action
+    else:
+        return 'HOLD'
+
 def find_option_symbols(exchange, underlying_symbol, strike_price):
     """
     Finds the call and put option symbols for a given strike price.
@@ -167,42 +190,79 @@ def run_scheduled_strategy(exchange, symbol):
     print(f"Determined Action: {action}")
 
     if action == 'CREATE_STRADDLE':
-        print("Case A: No open positions. Creating straddle.")
+        print("Case A: Creating straddle.")
         call_order = place_order(exchange, call_symbol, 'market', 'sell', 1)
         put_order = place_order(exchange, put_symbol, 'market', 'sell', 1)
         if call_order and put_order:
-            straddle_positions['call'] = call_order
-            straddle_positions['put'] = put_order
-            trade_count += 1
-            print("Straddle created successfully.")
+            call_entry_price = call_order.get('average') or call_order.get('price')
+            put_entry_price = put_order.get('average') or put_order.get('price')
+
+            if call_entry_price and put_entry_price:
+                straddle_positions['call'] = {'order_id': call_order['id'], 'entry_price': call_entry_price}
+                straddle_positions['put'] = {'order_id': put_order['id'], 'entry_price': put_entry_price}
+                trade_count += 1
+                print(f"Straddle created. Call entry: {call_entry_price}, Put entry: {put_entry_price}")
+            else:
+                print("Could not determine entry prices for straddle. Orders might not have filled.")
 
     elif action == 'RECONSTRUCT_STRADDLE':
-        print("Case C: One leg open. Reconstructing straddle.")
-        if straddle_positions['call'] is None:
+        print("Case C: Reconstructing straddle.")
+        if straddle_positions.get('call') is None:
             call_order = place_order(exchange, call_symbol, 'market', 'sell', 1)
             if call_order:
-                straddle_positions['call'] = call_order
-                print("Reconstructed straddle by selling call.")
-        if straddle_positions['put'] is None:
+                call_entry_price = call_order.get('average') or call_order.get('price')
+                if call_entry_price:
+                    straddle_positions['call'] = {'order_id': call_order['id'], 'entry_price': call_entry_price}
+                    print(f"Reconstructed straddle by selling call at {call_entry_price}.")
+                else:
+                    print("Could not determine entry price for call. Order might not have filled.")
+
+        if straddle_positions.get('put') is None:
             put_order = place_order(exchange, put_symbol, 'market', 'sell', 1)
             if put_order:
-                straddle_positions['put'] = put_order
-                print("Reconstructed straddle by selling put.")
+                put_entry_price = put_order.get('average') or put_order.get('price')
+                if put_entry_price:
+                    straddle_positions['put'] = {'order_id': put_order['id'], 'entry_price': put_entry_price}
+                    print(f"Reconstructed straddle by selling put at {put_entry_price}.")
+                else:
+                    print("Could not determine entry price for put. Order might not have filled.")
 
     elif action == 'CLOSE_GAINING_LEG':
-        print("Case B: Straddle open. Closing the gaining leg.")
-        # Simplified logic for now
-        underlying_ticker = exchange.fetch_ticker(symbol)
-        if underlying_ticker['last'] > atm_strike_price:
-            print("Underlying is up. Closing call position.")
-            close_order = place_order(exchange, call_symbol, 'market', 'buy', 1)
-            if close_order:
-                straddle_positions['call'] = None
-        else:
-            print("Underlying is down. Closing put position.")
-            close_order = place_order(exchange, put_symbol, 'market', 'buy', 1)
-            if close_order:
-                straddle_positions['put'] = None
+        print("Case B: Closing the gaining leg.")
+        try:
+            call_ticker = exchange.fetch_ticker(call_symbol)
+            put_ticker = exchange.fetch_ticker(put_symbol)
+
+            call_current_price = call_ticker['last']
+            put_current_price = put_ticker['last']
+
+            call_entry_price = straddle_positions['call']['entry_price']
+            put_entry_price = straddle_positions['put']['entry_price']
+
+            # For a sell position, profit = entry_price - current_price
+            call_pnl = call_entry_price - call_current_price
+            put_pnl = put_entry_price - put_current_price
+
+            print(f"Call PnL: {call_pnl:.4f}, Put PnL: {put_pnl:.4f}")
+
+            # The strategy is to close the LOSING leg (the one with the lower PnL).
+            # A rising premium on a short position results in a loss.
+            if call_pnl < put_pnl:
+                print("Call is the losing leg. Closing call position.")
+                close_order = place_order(exchange, call_symbol, 'market', 'buy', 1)
+                if close_order:
+                    straddle_positions['call'] = None
+            else:
+                print("Put is the losing leg. Closing put position.")
+                close_order = place_order(exchange, put_symbol, 'market', 'buy', 1)
+                if close_order:
+                    straddle_positions['put'] = None
+        except (ccxt.errors.ExchangeError, KeyError) as e:
+            print(f"An error occurred while closing gaining leg: {e}")
+
+    elif action == 'HOLD':
+        print("Holding positions.")
+
     else:
         print("No trade action taken.")
 
