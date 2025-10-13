@@ -15,13 +15,15 @@ def run_backtest():
     """
     print("Starting backtest...")
 
-    # --- User Input ---
-    start_date = input("Enter start date (YYYY-MM-DD): ")
-    end_date = input("Enter end date (YYYY-MM-DD): ")
-    timeframe = input("Enter timeframe for straddle graph (e.g., '15m', '1h'): ")
-    supertrend_length = int(input("Enter Supertrend length: "))
-    supertrend_multiplier = float(input("Enter Supertrend multiplier: "))
-    symbol = 'BTC/USDT'
+    # --- Parameters ---
+    # Note: Historical options data on Delta Exchange testnet can be sparse.
+    # Using a very recent date range is more likely to yield results.
+    start_date = "2024-05-01"
+    end_date = "2024-05-07"
+    timeframe = '15m'
+    supertrend_length = 10
+    supertrend_multiplier = 3
+    symbol = 'BTC/USD'
 
     # --- Exchange Setup ---
     exchange_id = 'delta'
@@ -30,10 +32,12 @@ def run_backtest():
         'apiKey': os.environ.get('DELTA_API_KEY'),
         'secret': os.environ.get('DELTA_API_SECRET'),
         'urls': {
-            'api': 'https://api.india.delta.exchange',
+            'api': {
+                'public': 'https://api.india.delta.exchange',
+                'private': 'https://api.india.delta.exchange',
+            },
         },
     })
-    exchange.set_sandbox_mode(True)
 
     # --- Historical Data Fetching ---
     def fetch_historical_data_for_backtest(symbol, date, timeframe):
@@ -77,18 +81,32 @@ def run_backtest():
 
     def find_option_symbols_for_backtest(markets, underlying_symbol, strike_price, current_date):
         call_symbol, put_symbol = None, None
-        min_expiry_diff = float('inf')
+
+        # Find the option with the closest expiry to the 24-hour cycle
+        min_expiry_diff = timedelta(days=100) # Initialize with a large diff
 
         for symbol, market in markets.items():
             if market.get('strike') == strike_price and market.get('base') == underlying_symbol.split('/')[0]:
                 expiry = pd.to_datetime(market.get('expiry'), unit='ms')
+
+                # We're looking for daily expiries, so the difference should be small
                 if expiry > current_date:
                     diff = expiry - current_date
-                    if diff < timedelta(days=7): # Weekly options
-                        if diff < min_expiry_diff:
-                            min_expiry_diff = diff
-                            call_symbol = symbol if market.get('optionType') == 'call' else call_symbol
-                            put_symbol = symbol if market.get('optionType') == 'put' else put_symbol
+                    if diff < min_expiry_diff:
+                        min_expiry_diff = diff
+                        # Reset symbols when a closer expiry is found
+                        call_symbol = None
+                        put_symbol = None
+
+        # After finding the closest expiry, find the call and put for that expiry
+        for symbol, market in markets.items():
+             if market.get('strike') == strike_price and market.get('base') == underlying_symbol.split('/')[0]:
+                expiry = pd.to_datetime(market.get('expiry'), unit='ms')
+                if expiry > current_date and (expiry - current_date) == min_expiry_diff:
+                    if market.get('optionType') == 'call':
+                        call_symbol = symbol
+                    elif market.get('optionType') == 'put':
+                        put_symbol = symbol
 
         return call_symbol, put_symbol
 
@@ -161,7 +179,7 @@ def run_backtest():
                     'put_entry': row['close_put']
                 })
 
-            elif action == 'CLOSE_GAINING_LEG':
+            elif action == 'CLOSE_LOSING_LEG':
                 if positions['call'] and positions['put']:
                     call_pnl = positions['call']['entry_price'] - row['close_call']
                     put_pnl = positions['put']['entry_price'] - row['close_put']

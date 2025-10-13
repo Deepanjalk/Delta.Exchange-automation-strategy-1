@@ -3,6 +3,8 @@ import ccxt
 import os
 import time
 import schedule
+import pytz
+from datetime import datetime
 from dotenv import load_dotenv
 from delta_strategy import set_daily_atm_strike, run_scheduled_strategy, reset_daily_state
 from backtest import run_backtest
@@ -17,7 +19,12 @@ def get_exchange():
     return exchange_class({
         'apiKey': os.environ.get('DELTA_API_KEY'),
         'secret': os.environ.get('DELTA_API_SECRET'),
-        'urls': { 'api': 'https://api.india.delta.exchange' },
+        'urls': {
+            'api': {
+                'public': 'https://api.india.delta.exchange',
+                'private': 'https://api.india.delta.exchange',
+            },
+        },
         'options': { 'recvWindow': 10000 },
     })
 
@@ -25,15 +32,34 @@ def strike_job():
     """Job for setting the daily ATM strike."""
     print("Executing daily strike identification job...")
     exchange = get_exchange()
-    exchange.set_sandbox_mode(True)
     set_daily_atm_strike(exchange, 'BTC/USD')
 
 def trade_job():
     """Job for running the trading strategy."""
     print("Executing 15-minute trading job...")
     exchange = get_exchange()
-    exchange.set_sandbox_mode(True)
     run_scheduled_strategy(exchange, 'BTC/USD')
+
+def get_local_schedule_time_for_ist(ist_time_str):
+    """
+    Converts a time string from IST to the server's local time for scheduling.
+    """
+    try:
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        now_ist = datetime.now(ist_tz)
+
+        time_parts = list(map(int, ist_time_str.split(':')))
+
+        target_ist_time = now_ist.replace(hour=time_parts[0], minute=time_parts[1], second=0, microsecond=0)
+
+        local_tz = datetime.now().astimezone().tzinfo
+
+        local_time = target_ist_time.astimezone(local_tz)
+
+        return local_time.strftime('%H:%M')
+    except Exception as e:
+        print(f"Could not convert IST time to local time: {e}. Defaulting to original time string.")
+        return ist_time_str
 
 def main():
     """
@@ -48,10 +74,17 @@ def main():
 
         if choice == '1':
             print("Starting live trading bot...")
-            # Schedule the jobs
-            schedule.every().day.at("17:35").do(strike_job)
+
+            # --- Schedule jobs in IST ---
+            reset_time_local = get_local_schedule_time_for_ist("17:30")
+            strike_time_local = get_local_schedule_time_for_ist("17:35")
+
+            print(f"Scheduling reset job for {reset_time_local} local time (17:30 IST)")
+            print(f"Scheduling strike job for {strike_time_local} local time (17:35 IST)")
+
+            schedule.every().day.at(reset_time_local).do(reset_daily_state)
+            schedule.every().day.at(strike_time_local).do(strike_job)
             schedule.every(15).minutes.do(trade_job)
-            schedule.every().day.at("17:30").do(reset_daily_state)
 
             print("Scheduler started. Running initial strike job...")
             strike_job() # Run once immediately to set the first strike
