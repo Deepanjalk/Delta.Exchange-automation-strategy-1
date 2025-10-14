@@ -21,7 +21,7 @@ def run_backtest(start_date="2025-10-13", timeframe='15m', supertrend_length=10,
     logger.info("Starting backtest simulation for a single trading session...")
     logger.info(f"Configuration: Date={start_date}, Timeframe={timeframe}, Supertrend={supertrend_length},{supertrend_multiplier}")
 
-    symbol = 'BTC/USD'
+    symbol = 'BTCUSD'
     strategy = TradingStrategy()
 
     # --- Exchange Setup ---
