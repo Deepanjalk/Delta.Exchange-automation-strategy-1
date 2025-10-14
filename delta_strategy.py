@@ -4,6 +4,8 @@ import pandas as pd
 import pandas_ta as ta
 import time
 import logging
+from datetime import datetime, timedelta
+import pytz
 from config import TIMEFRAME, SUPERTREND_LENGTH, SUPERTREND_MULTIPLIER
 
 # --- Logger Setup ---
@@ -100,7 +102,15 @@ class TradingStrategy:
         if df is None or df.empty:
             return None
         df.ta.supertrend(length=SUPERTREND_LENGTH, multiplier=SUPERTREND_MULTIPLIER, append=True)
-        df.rename(columns={f'SUPERTd_{SUPERTREND_LENGTH}_{SUPERTREND_MULTIPLIER}': 'supertrend_direction'}, inplace=True)
+
+        # The column name from pandas-ta is dynamic.
+        supertrend_direction_col = f'SUPERTd_{SUPERTREND_LENGTH}_{SUPERTREND_MULTIPLIER}'
+
+        if supertrend_direction_col not in df.columns:
+            logger.error(f"Supertrend direction column '{supertrend_direction_col}' not found. Available columns: {df.columns}")
+            return None
+
+        df.rename(columns={supertrend_direction_col: 'supertrend_direction'}, inplace=True)
         logger.info(f"Calculated Supertrend. Latest direction: {df.iloc[-1]['supertrend_direction']}")
         return df
 
@@ -117,17 +127,33 @@ class TradingStrategy:
             else:
                 order = exchange.create_order(symbol, order_type, side, amount)
 
-            # Verify order status
-            time.sleep(2) # Allow time for the order to be processed
-            fetched_order = exchange.fetch_order(order['id'], symbol)
+            # Poll order status to confirm it is filled
+            timeout_seconds = 60
+            poll_interval_seconds = 5
+            start_time = time.time()
 
-            is_filled = fetched_order['status'] == 'closed'
-            if is_filled:
-                logger.info(f"Order {order['id']} successfully filled.")
-            else:
-                logger.warning(f"Order {order['id']} status is {fetched_order['status']}.")
+            while time.time() - start_time < timeout_seconds:
+                try:
+                    fetched_order = exchange.fetch_order(order['id'], symbol)
+                    if fetched_order['status'] == 'closed':
+                        logger.info(f"Order {order['id']} successfully filled.")
+                        return fetched_order, True
+                    elif fetched_order['status'] in ['canceled', 'rejected']:
+                        logger.warning(f"Order {order['id']} was {fetched_order['status']}.")
+                        return fetched_order, False
 
-            return fetched_order, is_filled
+                    logger.info(f"Order {order['id']} status is {fetched_order['status']}. Retrying in {poll_interval_seconds}s...")
+                    time.sleep(poll_interval_seconds)
+
+                except ccxt.errors.NetworkError as e:
+                    logger.warning(f"Network error while fetching order status: {e}. Retrying...")
+                    time.sleep(poll_interval_seconds)
+                except ccxt.errors.ExchangeError as e:
+                    logger.error(f"Exchange error while fetching order status for {order['id']}: {e}")
+                    return None, False
+
+            logger.warning(f"Order {order['id']} did not fill within {timeout_seconds} seconds. Final status: {fetched_order.get('status', 'unknown')}.")
+            return fetched_order, False
 
         except ccxt.errors.ExchangeError as e:
             logger.error(f"An error occurred while placing an order: {e}")
@@ -151,17 +177,59 @@ class TradingStrategy:
 
     def _find_option_symbols(self, exchange, underlying_symbol, strike_price):
         """
-        Finds the call and put option symbols for a given strike price.
+        Finds the call and put option symbols for a given strike price with an expiry
+        closest to the next day's 5:30 PM IST.
         """
-        exchange.load_markets(True)
-        markets = exchange.markets
+        try:
+            exchange.load_markets(True)
+            markets = exchange.markets
+        except (ccxt.errors.NetworkError, ccxt.errors.ExchangeError) as e:
+            logger.error(f"Could not load markets from exchange: {e}")
+            return None, None
+
         call_symbol, put_symbol = None, None
+
+        ist = pytz.timezone('Asia/Kolkata')
+        now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+
+        # Target is 5:30 PM IST on the next day
+        target_expiry_time_ist = (now_utc.astimezone(ist) + timedelta(days=1)).replace(hour=17, minute=30, second=0, microsecond=0)
+        target_expiry_time_utc = target_expiry_time_ist.astimezone(pytz.utc)
+
+        min_expiry_diff = timedelta(days=365) # Initialize with a large value
+
+        # First pass to find the closest expiry date to our target
+        closest_expiry_ts = None
         for symbol, market in markets.items():
-            if market.get('strike') == strike_price and market.get('base') == underlying_symbol.split('/')[0]:
+            if (market.get('strike') == strike_price and
+                market.get('base') == underlying_symbol.split('/')[0] and
+                market.get('expiry') is not None):
+
+                expiry_ts = market.get('expiry')
+                expiry_dt = datetime.fromtimestamp(expiry_ts / 1000, tz=pytz.utc)
+
+                # We only care about options expiring in the future
+                if expiry_dt > now_utc:
+                    diff = abs(expiry_dt - target_expiry_time_utc)
+                    if diff < min_expiry_diff:
+                        min_expiry_diff = diff
+                        closest_expiry_ts = expiry_ts
+
+        if closest_expiry_ts is None:
+            logger.warning(f"No future options found for strike {strike_price}.")
+            return None, None
+
+        # Second pass to get the symbols for the identified expiry date
+        for symbol, market in markets.items():
+            if (market.get('strike') == strike_price and
+                market.get('base') == underlying_symbol.split('/')[0] and
+                market.get('expiry') == closest_expiry_ts):
+
                 if market.get('optionType') == 'call':
                     call_symbol = symbol
                 elif market.get('optionType') == 'put':
                     put_symbol = symbol
+
         return call_symbol, put_symbol
 
     def set_daily_atm_strike(self, exchange, symbol):
@@ -192,6 +260,9 @@ class TradingStrategy:
         if not all([call_symbol, put_symbol]):
             logger.error(f"Could not find option symbols for strike {self.atm_strike_price}. Exiting.")
             return
+
+        self.call_symbol = call_symbol
+        self.put_symbol = put_symbol
 
         logger.info(f"Using ATM Call: {self.call_symbol}, ATM Put: {self.put_symbol}")
 
