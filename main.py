@@ -47,12 +47,12 @@ def main():
     def strike_job():
         logger.info("Executing daily strike identification job...")
         exchange = get_exchange()
-        strategy.set_daily_atm_strike(exchange, 'BTC/USD')
+        strategy.set_daily_atm_strike(exchange, 'BTCUSD')
 
     def trade_job():
         logger.info("Executing 15-minute trading job...")
         exchange = get_exchange()
-        strategy.run_scheduled_strategy(exchange, 'BTC/USD')
+        strategy.run_scheduled_strategy(exchange, 'BTCUSD')
 
     def reset_job():
         strategy.reset_daily_state()

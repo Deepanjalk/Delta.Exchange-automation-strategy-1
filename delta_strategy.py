@@ -30,15 +30,18 @@ class TradingStrategy:
             logger.info(f"Underlying price for {symbol}: {underlying_price}")
             exchange.load_markets(True)
             markets = exchange.markets
+
+            base_currency = 'BTC' # Explicitly define the base currency
+
             options = {
                 s: m for s, m in markets.items()
-                if m.get('option') and m.get('base') == symbol.split('/')[0]
+                if m.get('option') and m.get('base') == base_currency
             }
             if not options:
-                logger.warning(f"No options found for {symbol.split('/')[0]}")
+                logger.warning(f"No options found for {base_currency}")
                 return None
 
-            logger.info(f"Found {len(options)} options for {symbol.split('/')[0]}")
+            logger.info(f"Found {len(options)} options for {base_currency}")
 
             closest_strike = None
             min_diff = float('inf')
@@ -200,9 +203,10 @@ class TradingStrategy:
 
         # First pass to find the closest expiry date to our target
         closest_expiry_ts = None
+        base_currency = 'BTC' # Explicitly define the base currency
         for symbol, market in markets.items():
             if (market.get('strike') == strike_price and
-                market.get('base') == underlying_symbol.split('/')[0] and
+                market.get('base') == base_currency and
                 market.get('expiry') is not None):
 
                 expiry_ts = market.get('expiry')
@@ -222,7 +226,7 @@ class TradingStrategy:
         # Second pass to get the symbols for the identified expiry date
         for symbol, market in markets.items():
             if (market.get('strike') == strike_price and
-                market.get('base') == underlying_symbol.split('/')[0] and
+                market.get('base') == base_currency and
                 market.get('expiry') == closest_expiry_ts):
 
                 if market.get('optionType') == 'call':
