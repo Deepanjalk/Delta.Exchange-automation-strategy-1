@@ -88,12 +88,14 @@ def main():
 
             schedule.every().day.at(reset_time_local).do(reset_job)
             schedule.every().day.at(strike_time_local).do(strike_job)
-            schedule.every(15).minutes.do(trade_job)
 
-            logger.info("Scheduler started. Running initial strike job...")
-            strike_job()
+            # Align trading job to the 15-minute candles
+            schedule.every().hour.at(":00").do(trade_job)
+            schedule.every().hour.at(":15").do(trade_job)
+            schedule.every().hour.at(":30").do(trade_job)
+            schedule.every().hour.at(":45").do(trade_job)
 
-            logger.info("Waiting for scheduled jobs...")
+            logger.info("Scheduler started. Waiting for scheduled jobs...")
             while True:
                 schedule.run_pending()
                 time.sleep(1)
