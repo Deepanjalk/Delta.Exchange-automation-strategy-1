@@ -21,7 +21,7 @@ def run_backtest(start_date="2025-10-13", timeframe='15m', supertrend_length=10,
     logger.info("Starting backtest simulation for a single trading session...")
     logger.info(f"Configuration: Date={start_date}, Timeframe={timeframe}, Supertrend={supertrend_length},{supertrend_multiplier}")
 
-    symbol = 'BTCUSD'
+    symbol = 'BTC/USD'
     strategy = TradingStrategy()
 
     # --- Exchange Setup ---
@@ -74,46 +74,63 @@ def run_backtest(start_date="2025-10-13", timeframe='15m', supertrend_length=10,
 
     logger.info(f"Using Call: {call_symbol}, Put: {put_symbol}")
 
-    # Simulate candle-by-candle processing
-    timeframe_duration_ms = exchange.parse_timeframe(timeframe) * 1000
-    for i in range(200): # Simulate for a reasonable number of candles
-        since = start_ts + i * timeframe_duration_ms
+    # --- Fetch historical data in a single batch ---
+    logger.info(f"Fetching historical data for {call_symbol} and {put_symbol}...")
+    try:
+        call_ohlcv = exchange.fetch_ohlcv(call_symbol, timeframe, since=start_ts, limit=200)
+        put_ohlcv = exchange.fetch_ohlcv(put_symbol, timeframe, since=start_ts, limit=200)
+    except Exception as e:
+        logger.error(f"Error fetching historical data batch: {e}")
+        return
 
-        try:
-            call_ohlcv = exchange.fetch_ohlcv(call_symbol, timeframe, since, limit=1)
-            put_ohlcv = exchange.fetch_ohlcv(put_symbol, timeframe, since, limit=1)
-        except Exception as e:
-            logger.error(f"Error fetching candle data: {e}")
-            continue
+    if not call_ohlcv or not put_ohlcv:
+        logger.error("Could not fetch historical data for backtest. Aborting.")
+        return
 
-        if not call_ohlcv or not put_ohlcv:
-            logger.warning("No more candle data available for this session.")
-            break
+    call_df = pd.DataFrame(call_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    call_df['timestamp'] = pd.to_datetime(call_df['timestamp'], unit='ms')
+    call_df.set_index('timestamp', inplace=True)
 
-        call_candle = call_ohlcv[0]
-        put_candle = put_ohlcv[0]
+    put_df = pd.DataFrame(put_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    put_df['timestamp'] = pd.to_datetime(put_df['timestamp'], unit='ms')
+    put_df.set_index('timestamp', inplace=True)
 
-        timestamp = pd.to_datetime(call_candle[0], unit='ms')
+    # Merge and create the full straddle dataframe for the day
+    backtest_df = pd.merge(
+        call_df, put_df, left_index=True, right_index=True,
+        how='inner', suffixes=('_call', '_put')
+    )
+    backtest_df['close'] = backtest_df['close_call'] + backtest_df['close_put']
+    backtest_df['high'] = backtest_df['high_call'] + backtest_df['high_put']
+    backtest_df['low'] = backtest_df['low_call'] + backtest_df['low_put']
 
-        row_data = {
-            'open_call': call_candle[1], 'high_call': call_candle[2], 'low_call': call_candle[3], 'close_call': call_candle[4],
-            'open_put': put_candle[1], 'high_put': put_candle[2], 'low_put': put_candle[3], 'close_put': put_candle[4],
-            'close': call_candle[4] + put_candle[4],
-            'high': call_candle[2] + put_candle[2],
-            'low': call_candle[3] + put_candle[3]
-        }
+    logger.info(f"Successfully fetched {len(backtest_df)} candles for backtesting.")
 
-        new_row = pd.DataFrame(row_data, index=[timestamp])
+    # --- Simulate candle-by-candle processing using the fetched data ---
+    for index, row in backtest_df.iterrows():
+        timestamp = index
+        row_data = row.to_dict()
+
+        # Append the current candle to the strategy's dataframe
+        new_row = pd.DataFrame({
+            'open': row_data['open_call'] + row_data['open_put'],
+            'high': row_data['high'],
+            'low': row_data['low'],
+            'close': row_data['close'],
+        }, index=[timestamp])
+
         strategy.straddle_data_df = pd.concat([strategy.straddle_data_df, new_row])
 
-        if len(strategy.straddle_data_df) < supertrend_length + 2:
+        # Wait for enough data to calculate Supertrend
+        if len(strategy.straddle_data_df) < supertrend_length + 2: # Warm-up period for pandas-ta
             continue
 
-        strategy.straddle_data_df = strategy._get_supertrend(strategy.straddle_data_df.copy())
-        if strategy.straddle_data_df is None:
+        # Calculate Supertrend on a copy of the dataframe
+        current_supertrend_df = strategy._get_supertrend(strategy.straddle_data_df.copy())
+        if current_supertrend_df is None:
             continue
 
-        latest_signal = strategy.straddle_data_df.iloc[-1]
+        latest_signal = current_supertrend_df.iloc[-1]
         supertrend_direction = latest_signal.get('supertrend_direction')
         action = strategy._determine_trade_action(supertrend_direction)
 
