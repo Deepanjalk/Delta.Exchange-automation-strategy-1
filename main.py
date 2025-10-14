@@ -52,7 +52,7 @@ def main():
     def trade_job():
         logger.info("Executing 15-minute trading job...")
         exchange = get_exchange()
-        strategy.run_scheduled_strategy(exchange)
+        strategy.run_scheduled_strategy(exchange, 'BTC/USD')
 
     def reset_job():
         strategy.reset_daily_state()
