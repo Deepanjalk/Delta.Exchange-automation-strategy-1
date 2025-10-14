@@ -35,10 +35,10 @@ class TradingStrategy:
 
             options = {
                 s: m for s, m in markets.items()
-                if m.get('option') and m.get('base') == base_currency
+                if m.get('option') and m.get('base') == base_currency and m.get('strike') is not None
             }
             if not options:
-                logger.warning(f"No options found for {base_currency}")
+                logger.warning(f"No options with strike prices found for {base_currency}")
                 return None
 
             logger.info(f"Found {len(options)} options for {base_currency}")
@@ -58,12 +58,14 @@ class TradingStrategy:
             logger.error(f"An error occurred: {e}")
             return None
 
-    def _get_historical_data(self, exchange, symbol, limit=200):
+    def _get_historical_data(self, exchange, symbol, since=None, limit=200):
         """
         Fetches historical OHLCV data.
         """
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, since=since, limit=limit)
+            if not ohlcv:
+                return pd.DataFrame()
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
@@ -119,48 +121,61 @@ class TradingStrategy:
 
     def _place_order(self, exchange, symbol, order_type, side, amount, price=None):
         """
-        Places an order and verifies its status.
+        Places an order, retries on failure, and verifies its status.
         Returns the order object and a boolean indicating if it was filled.
         """
-        try:
-            logger.info(f"Placing {side} {order_type} order for {amount} contracts of {symbol}...")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Placing {side} {order_type} order for {amount} of {symbol} (Attempt {attempt + 1}/{max_retries})...")
 
-            if order_type == 'limit':
-                order = exchange.create_order(symbol, order_type, side, amount, price)
-            else:
-                order = exchange.create_order(symbol, order_type, side, amount)
+                if order_type == 'limit':
+                    order = exchange.create_order(symbol, order_type, side, amount, price)
+                else:
+                    order = exchange.create_order(symbol, order_type, side, amount)
 
-            # Poll order status to confirm it is filled
-            timeout_seconds = 60
-            poll_interval_seconds = 5
-            start_time = time.time()
+                # Poll order status to confirm it is filled
+                timeout_seconds = 60
+                poll_interval_seconds = 5
+                start_time = time.time()
 
-            while time.time() - start_time < timeout_seconds:
+                while time.time() - start_time < timeout_seconds:
+                    try:
+                        fetched_order = exchange.fetch_order(order['id'], symbol)
+                        if fetched_order['status'] == 'closed':
+                            logger.info(f"Order {order['id']} successfully filled.")
+                            return fetched_order, True
+                        elif fetched_order['status'] in ['canceled', 'rejected']:
+                            logger.warning(f"Order {order['id']} was {fetched_order['status']}.")
+                            return fetched_order, False # No retry if rejected/canceled
+
+                        logger.info(f"Order {order['id']} status is {fetched_order['status']}. Retrying in {poll_interval_seconds}s...")
+                        time.sleep(poll_interval_seconds)
+
+                    except ccxt.errors.NetworkError as e:
+                        logger.warning(f"Network error while fetching order status: {e}. Retrying...")
+                        time.sleep(poll_interval_seconds)
+                    except ccxt.errors.ExchangeError as e:
+                        logger.error(f"Exchange error while fetching order status for {order['id']}: {e}")
+                        break # Break polling loop on exchange error
+
+                logger.warning(f"Order {order['id']} did not fill within {timeout_seconds} seconds.")
+                # Attempt to cancel the lingering order before retrying
                 try:
-                    fetched_order = exchange.fetch_order(order['id'], symbol)
-                    if fetched_order['status'] == 'closed':
-                        logger.info(f"Order {order['id']} successfully filled.")
-                        return fetched_order, True
-                    elif fetched_order['status'] in ['canceled', 'rejected']:
-                        logger.warning(f"Order {order['id']} was {fetched_order['status']}.")
-                        return fetched_order, False
+                    exchange.cancel_order(order['id'], symbol)
+                    logger.info(f"Canceled lingering order {order['id']}.")
+                except ccxt.errors.ExchangeError as cancel_e:
+                    logger.error(f"Could not cancel lingering order {order['id']}: {cancel_e}")
 
-                    logger.info(f"Order {order['id']} status is {fetched_order['status']}. Retrying in {poll_interval_seconds}s...")
-                    time.sleep(poll_interval_seconds)
-
-                except ccxt.errors.NetworkError as e:
-                    logger.warning(f"Network error while fetching order status: {e}. Retrying...")
-                    time.sleep(poll_interval_seconds)
-                except ccxt.errors.ExchangeError as e:
-                    logger.error(f"Exchange error while fetching order status for {order['id']}: {e}")
+            except ccxt.errors.ExchangeError as e:
+                logger.error(f"An error occurred while placing order on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    logger.info("Retrying in 10 seconds...")
+                    time.sleep(10)
+                else:
+                    logger.critical("Order placement failed after multiple retries. This is a critical error.")
                     return None, False
-
-            logger.warning(f"Order {order['id']} did not fill within {timeout_seconds} seconds. Final status: {fetched_order.get('status', 'unknown')}.")
-            return fetched_order, False
-
-        except ccxt.errors.ExchangeError as e:
-            logger.error(f"An error occurred while placing an order: {e}")
-            return None, False
+        return None, False
 
     def _determine_trade_action(self, supertrend_direction):
         """
@@ -270,35 +285,53 @@ class TradingStrategy:
 
         logger.info(f"Using ATM Call: {self.call_symbol}, ATM Put: {self.put_symbol}")
 
-        call_df = self._get_historical_data(exchange, self.call_symbol, limit=2)
-        put_df = self._get_historical_data(exchange, self.put_symbol, limit=2)
+        # --- Unified Data Fetching Logic ---
+        since_timestamp = None
+        limit = 2  # By default, fetch latest 2 candles to be safe
 
-        if call_df is None or put_df is None or call_df.empty or put_df.empty:
-            logger.warning("Could not fetch latest candle data. Exiting.")
+        if self.straddle_data_df.empty:
+            logger.info("First run for this session. Fetching all available candles...")
+            ist = pytz.timezone('Asia/Kolkata')
+            now_ist = datetime.now(ist)
+            session_start_time = now_ist.replace(hour=17, minute=30, second=0, microsecond=0)
+
+            # If current time is before 5:30PM, session started yesterday
+            if now_ist.time() < session_start_time.time():
+                session_start_time -= timedelta(days=1)
+
+            since_timestamp = int(session_start_time.timestamp() * 1000)
+            limit = 200  # Fetch up to 200 candles for the day
+
+        call_df = self._get_historical_data(exchange, self.call_symbol, since=since_timestamp, limit=limit)
+        put_df = self._get_historical_data(exchange, self.put_symbol, since=since_timestamp, limit=limit)
+
+        if call_df.empty and self.straddle_data_df.empty:
+            logger.warning("Could not fetch any candle data. Will try again on the next run.")
             return
 
-        latest_call_candle = call_df.iloc[-1]
-        latest_put_candle = put_df.iloc[-1]
+        if not call_df.empty and not put_df.empty:
+            # Combine the fetched data
+            combined_df = pd.merge(
+                call_df, put_df, left_index=True, right_index=True,
+                how='inner', suffixes=('_call', '_put')
+            )
 
-        if latest_call_candle.name != latest_put_candle.name:
-            logger.warning("Candle timestamps do not match. Exiting.")
-            return
+            if not combined_df.empty:
+                # Create straddle data from the combined data
+                straddle_df_new = pd.DataFrame(index=combined_df.index)
+                straddle_df_new['open'] = combined_df['open_call'] + combined_df['open_put']
+                straddle_df_new['high'] = combined_df['high_call'] + combined_df['high_put']
+                straddle_df_new['low'] = combined_df['low_call'] + combined_df['low_put']
+                straddle_df_new['close'] = combined_df['close_call'] + combined_df['close_put']
+                straddle_df_new['volume'] = combined_df['volume_call'] + combined_df['volume_put']
 
-        straddle_candle = {
-            'timestamp': latest_call_candle.name,
-            'open': latest_call_candle['open'] + latest_put_candle['open'],
-            'high': latest_call_candle['high'] + latest_put_candle['high'],
-            'low': latest_call_candle['low'] + latest_put_candle['low'],
-            'close': latest_call_candle['close'] + latest_put_candle['close'],
-            'volume': latest_call_candle['volume'] + latest_put_candle['volume']
-        }
+                # Update the main dataframe, avoiding duplicates
+                new_candles = straddle_df_new[~straddle_df_new.index.isin(self.straddle_data_df.index)]
+                if not new_candles.empty:
+                    self.straddle_data_df = pd.concat([self.straddle_data_df, new_candles]).sort_index()
+                    logger.info(f"Added {len(new_candles)} new candle(s) to the series.")
 
-        if straddle_candle['timestamp'] not in self.straddle_data_df.index:
-            new_row = pd.DataFrame([straddle_candle])
-            new_row.set_index('timestamp', inplace=True)
-            self.straddle_data_df = pd.concat([self.straddle_data_df, new_row])
-
-        logger.info(f"Collected {len(self.straddle_data_df)} candles for the day.")
+        logger.info(f"Total collected candles for the day: {len(self.straddle_data_df)}")
 
         if len(self.straddle_data_df) < SUPERTREND_LENGTH:
             logger.info("Not enough data to calculate Supertrend yet. Waiting for more candles.")
@@ -333,7 +366,8 @@ class TradingStrategy:
                 self.trade_count += 1
                 logger.info(f"Straddle created. Call entry: {call_entry_price}, Put entry: {put_entry_price}")
             else:
-                logger.error("Failed to create complete straddle. One or both orders did not fill.")
+                logger.critical("Failed to create complete straddle. One or both orders did not fill.")
+                self._exit_all_positions(exchange)
 
         elif action == 'RECONSTRUCT_STRADDLE':
             logger.info("Case C: Reconstructing straddle.")
@@ -344,16 +378,18 @@ class TradingStrategy:
                     self.straddle_positions['call'] = {'order_id': call_order['id'], 'entry_price': call_entry_price}
                     logger.info(f"Reconstructed straddle by selling call at {call_entry_price}.")
                 else:
-                    logger.error("Failed to reconstruct straddle. Call order did not fill.")
+                    logger.critical("Failed to reconstruct straddle. Call order did not fill.")
+                    self._exit_all_positions(exchange)
 
-            if self.straddle_positions.get('put') is None:
+            elif self.straddle_positions.get('put') is None:
                 put_order, put_filled = self._place_order(exchange, self.put_symbol, 'market', 'sell', 1)
                 if put_filled:
                     put_entry_price = put_order.get('average') or put_order.get('price')
                     self.straddle_positions['put'] = {'order_id': put_order['id'], 'entry_price': put_entry_price}
                     logger.info(f"Reconstructed straddle by selling put at {put_entry_price}.")
                 else:
-                    logger.error("Failed to reconstruct straddle. Put order did not fill.")
+                    logger.critical("Failed to reconstruct straddle. Put order did not fill.")
+                    self._exit_all_positions(exchange)
 
         elif action == 'CLOSE_LOSING_LEG':
             logger.info("Case B: Closing the losing leg.")
@@ -392,6 +428,25 @@ class TradingStrategy:
 
         logger.info(f"Current positions: {self.straddle_positions}")
         logger.info("="*50 + "\n")
+
+    def _exit_all_positions(self, exchange):
+        """
+        A safety mechanism to close all open positions with market orders.
+        """
+        logger.warning("Executing safety exit for all open positions.")
+        if self.straddle_positions.get('call'):
+            logger.info(f"Closing open call position for {self.call_symbol}...")
+            self._place_order(exchange, self.call_symbol, 'market', 'buy', 1)
+            self.straddle_positions['call'] = None
+
+        if self.straddle_positions.get('put'):
+            logger.info(f"Closing open put position for {self.put_symbol}...")
+            self._place_order(exchange, self.put_symbol, 'market', 'buy', 1)
+            self.straddle_positions['put'] = None
+
+        logger.critical("All positions have been closed due to a critical error. Halting further trades for the day.")
+        # To prevent further trades, we can set trade_count to a high number
+        self.trade_count = 99
 
     def reset_daily_state(self):
         logger.info("Resetting daily state for new trading session.")
