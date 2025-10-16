@@ -361,10 +361,16 @@ class DeltaExchangeAPI:
         try:
             # Get current price of underlying
             ticker = self.get_ticker(underlying_symbol)
-            current_price = float(ticker['close'])
+            if not ticker.get('success', False):
+                logger.error(f"Failed to get ticker for {underlying_symbol}: {ticker}")
+                return None
+
+            current_price = float(ticker['result']['spot_price'])
             
             # Get option chain
-            option_chain = self.get_option_chain(underlying_symbol.split('/')[0])
+            # The API expects the base asset symbol for option chain, e.g., 'BTC' from 'BTC/USD'
+            base_asset = underlying_symbol.split('/')[0]
+            option_chain = self.get_option_chain(base_asset)
             
             if not option_chain:
                 logger.warning(f"No options found for {underlying_symbol}")

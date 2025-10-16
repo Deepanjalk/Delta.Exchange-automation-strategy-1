@@ -14,6 +14,45 @@ logger = logging.getLogger(__name__)
 # Load environment variables from .env file
 load_dotenv()
 
+class MockDeltaExchangeAPI(DeltaExchangeAPI):
+    def __init__(self):
+        # Mock class, no actual API keys needed
+        pass
+
+    def get_atm_strike_price(self, underlying_symbol: str):
+        # Return a plausible, static ATM strike price for testing
+        logger.info("MOCK: Returning static ATM strike price.")
+        return 67500.0
+
+    def find_option_symbols(self, underlying_symbol: str, strike_price: float):
+        # Return static option symbols for testing
+        logger.info("MOCK: Returning static option symbols.")
+        return f"C-BTC-{strike_price}-251025", f"P-BTC-{strike_price}-251025"
+
+    def create_straddle_data(self, call_symbol: str, put_symbol: str, resolution: str, hours_back: int):
+        # Generate synthetic straddle data for backtesting
+        logger.info("MOCK: Generating synthetic straddle data.")
+        base_price = 1500
+        data = []
+        start_time = datetime.utcnow() - timedelta(hours=hours_back)
+        for i in range(hours_back * (60 // int(resolution.replace('m', '')))):
+            ts = start_time + timedelta(minutes=i * int(resolution.replace('m', '')))
+            price_movement = (i % 10 - 5) * 10  # Some volatility
+            open_price = base_price + price_movement
+            close_price = open_price + (i % 3 - 1) * 5
+            high_price = max(open_price, close_price) + 5
+            low_price = min(open_price, close_price) - 5
+
+            data.append({
+                'timestamp': int(ts.timestamp() * 1000),
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': close_price,
+                'volume': 100 + i
+            })
+        return data
+
 def run_backtest(start_date="2025-10-13", timeframe='15m', supertrend_length=10, supertrend_multiplier=3):
     """
     Runs a single-day backtesting simulation based on the strategy's constraints.
@@ -23,15 +62,20 @@ def run_backtest(start_date="2025-10-13", timeframe='15m', supertrend_length=10,
 
     symbol = 'BTCUSD'
     
-    # Initialize API client
+    # Initialize API client (real or mock)
+    api_key = os.environ.get('DELTA_API_KEY')
+    api_secret = os.environ.get('DELTA_API_SECRET')
+
+    if not api_key or not api_secret:
+        logger.warning("API keys not found in environment. Using mock client for backtest.")
+        api_client = MockDeltaExchangeAPI()
+    else:
+        api_client = DeltaExchangeAPI(api_key=api_key, api_secret=api_secret)
+
     try:
-        api_client = DeltaExchangeAPI(
-            api_key=os.environ.get('DELTA_API_KEY'),
-            api_secret=os.environ.get('DELTA_API_SECRET')
-        )
         strategy = TradingStrategy(api_client)
     except Exception as e:
-        logger.error(f"Failed to initialize API client: {e}")
+        logger.error(f"Failed to initialize strategy: {e}")
         return
 
     # --- Simulation Settings ---
