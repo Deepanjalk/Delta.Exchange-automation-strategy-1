@@ -1,5 +1,6 @@
-ccxt
 pandas
 pandas-ta
 schedule
 python-dotenv
+requests
+pytz
