@@ -308,15 +308,23 @@ class TradingStrategy:
             logger.info("Case B: Closing the losing leg.")
             try:
                 # Get current prices for both options and underlying BTC
-                call_ticker = self.api_client.get_ticker(self.call_symbol)
-                put_ticker = self.api_client.get_ticker(self.put_symbol)
-                
-                # Get underlying BTC price to determine direction
-                btc_ticker = self.api_client.get_ticker('BTCUSD')  # Adjust symbol as needed
-                btc_current_price = float(btc_ticker['close'])
+                call_ticker_response = self.api_client.get_ticker(self.call_symbol)
+                put_ticker_response = self.api_client.get_ticker(self.put_symbol)
+                btc_ticker_response = self.api_client.get_ticker('BTCUSD')
 
+                # Validate ticker responses
+                if not (call_ticker_response.get('success') and put_ticker_response.get('success') and btc_ticker_response.get('success')):
+                    logger.error("Failed to retrieve one or more tickers. Cannot close losing leg.")
+                    return
+
+                call_ticker = call_ticker_response['result']
+                put_ticker = put_ticker_response['result']
+                btc_ticker = btc_ticker_response['result']
+
+                # Use 'close' for option price, 'spot_price' for underlying
                 call_current_price = float(call_ticker['close'])
                 put_current_price = float(put_ticker['close'])
+                btc_current_price = float(btc_ticker['spot_price'])
 
                 call_entry_price = self.straddle_positions['call']['entry_price']
                 put_entry_price = self.straddle_positions['put']['entry_price']
