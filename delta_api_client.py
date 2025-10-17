@@ -368,8 +368,8 @@ class DeltaExchangeAPI:
             current_price = float(ticker['result']['spot_price'])
             
             # Get option chain
-            # The API expects the base asset symbol for option chain, e.g., 'BTC' from 'BTC/USD'
-            base_asset = underlying_symbol.split('/')[0]
+            # The API expects the base asset symbol for option chain, e.g., 'BTC' from 'BTCUSD'
+            base_asset = underlying_symbol.replace('USD', '')
             option_chain = self.get_option_chain(base_asset)
             
             if not option_chain:
@@ -400,7 +400,7 @@ class DeltaExchangeAPI:
         Find call and put option symbols for given strike and expiry
         """
         try:
-            base_asset = underlying_symbol.split('/')[0]
+            base_asset = underlying_symbol.replace('USD', '')
             option_chain = self.get_option_chain(base_asset)
             
             if not option_chain:
